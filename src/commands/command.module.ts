@@ -23,6 +23,8 @@ import { PlayLikedCommand } from './playliked/playliked.command';
 import { VolumeCommand } from './volume/volume.command';
 import { ShuffleCommand } from './shuffle.command';
 import { BotStatusCommand } from './bot_status/bot_status.command';
+import { ForwardCommand } from './seek/forward.command';
+import { BackCommand } from './seek/back.command';
 
 @Module({
   imports: [
@@ -50,6 +52,8 @@ import { BotStatusCommand } from './bot_status/bot_status.command';
     VolumeCommand,
     ShuffleCommand,
     BotStatusCommand,
+    ForwardCommand,
+    BackCommand,
     ChannelLockGuard,
     DeferReplyGuard,
   ],

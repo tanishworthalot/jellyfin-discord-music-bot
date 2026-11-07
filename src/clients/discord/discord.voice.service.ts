@@ -8,9 +8,12 @@ import {
   getVoiceConnections,
   joinVoiceChannel,
   NoSubscriberBehavior,
+  StreamType,
   VoiceConnection,
   VoiceConnectionStatus,
 } from '@discordjs/voice';
+
+import { spawn } from 'node:child_process';
 
 import { Injectable, Logger, OnModuleDestroy, Scope } from '@nestjs/common';
 import { EventEmitter2, OnEvent } from '@nestjs/event-emitter';
@@ -46,6 +49,9 @@ export class DiscordVoiceService implements OnModuleDestroy {
   private audioPlayers: Map<string, AudioPlayer> = new Map();
   private voiceConnections: Map<string, VoiceConnection> = new Map();
   private audioResources: Map<string, AudioResource> = new Map();
+  // Where the current resource started within its track, in ms. Non-zero after a seek,
+  // because a seek restarts the stream and the resource's own clock begins at 0 again.
+  private seekOffsets: Map<string, number> = new Map();
   private autoLeaveIntervalIds: Map<string, NodeJS.Timeout> = new Map();
   private voiceChannelInfos: Map<
     string,
@@ -107,7 +113,91 @@ export class DiscordVoiceService implements OnModuleDestroy {
       this.normalizationFactor = 1;
     }
 
+    if (this.activeGuildId) {
+      this.seekOffsets.set(this.activeGuildId, 0);
+    }
+
     this.playResource(resource, track.name, url);
+  }
+
+  /**
+   * Moves the current track forwards or backwards by the given amount.
+   * Restarts the stream through FFmpeg with an input seek, since the audio
+   * resource itself cannot be rewound. Resumes playback if the bot was paused.
+   *
+   * @param deltaMs Positive to skip forward, negative to go back
+   * @returns The new position and the track duration in ms, or undefined if nothing is playing
+   */
+  seekRelative(
+    deltaMs: number,
+    guildId?: string,
+  ): { positionMs: number; durationMs: number; clamped: boolean } | undefined {
+    const targetGuildId = guildId || this.activeGuildId;
+    if (!targetGuildId) {
+      this.logger.error('Failed to seek, no active guild');
+      return undefined;
+    }
+
+    const track = this.playbackService.getPlaylistOrDefault().getActiveTrack();
+    if (!track || !this.audioResources.has(targetGuildId)) {
+      return undefined;
+    }
+
+    // Leave a second at the end so the track doesn't finish before the new stream starts
+    const maxPosition = Math.max(0, track.getDuration() - 1000);
+    const requested = track.getPlaybackProgress() + deltaMs;
+    const positionMs = Math.max(0, Math.min(requested, maxPosition));
+    const clamped = positionMs !== requested;
+
+    const url = track.getStreamUrl(this.jellyfinStreamBuilder);
+
+    const ffmpeg = spawn(
+      'ffmpeg',
+      [
+        '-ss',
+        (positionMs / 1000).toFixed(3),
+        '-i',
+        url,
+        '-analyzeduration',
+        '0',
+        '-loglevel',
+        'error',
+        '-f',
+        's16le',
+        '-ar',
+        '48000',
+        '-ac',
+        '2',
+        'pipe:1',
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+
+    ffmpeg.on('error', (error) => {
+      this.logger.error(`Failed to start ffmpeg for seek: ${error.message}`);
+    });
+    ffmpeg.stderr.on('data', (chunk: Buffer) => {
+      this.logger.warn(`ffmpeg (seek): ${chunk.toString().trim()}`);
+    });
+
+    const resource = createAudioResource(ffmpeg.stdout, {
+      inputType: StreamType.Raw,
+      inlineVolume: true,
+    });
+    resource.playStream.on('close', () => {
+      ffmpeg.kill('SIGKILL');
+    });
+
+    this.logger.debug(
+      `Seeking '${track.name}' to ${positionMs}ms (delta ${deltaMs}ms) for guild ${targetGuildId}`,
+    );
+
+    this.seekOffsets.set(targetGuildId, positionMs);
+    track.updatePlaybackProgress(positionMs);
+    this.playResource(resource, track.name, url, targetGuildId);
+    track.playing = true;
+
+    return { positionMs, durationMs: track.getDuration(), clamped };
   }
 
   tryJoinChannelAndEstablishVoiceConnection(
@@ -460,6 +550,7 @@ export class DiscordVoiceService implements OnModuleDestroy {
     this.audioPlayers.delete(guildId);
     this.voiceConnections.delete(guildId);
     this.audioResources.delete(guildId);
+    this.seekOffsets.delete(guildId);
     this.voiceChannelInfos.delete(guildId);
 
     if (this.activeGuildId === guildId) {
@@ -542,6 +633,7 @@ export class DiscordVoiceService implements OnModuleDestroy {
     this.audioPlayers.delete(targetGuildId);
     this.voiceConnections.delete(targetGuildId);
     this.audioResources.delete(targetGuildId);
+    this.seekOffsets.delete(targetGuildId);
     this.voiceChannelInfos.delete(targetGuildId);
 
     if (this.activeGuildId === targetGuildId) {
@@ -567,6 +659,7 @@ export class DiscordVoiceService implements OnModuleDestroy {
     this.voiceConnections.clear();
     this.audioPlayers.clear();
     this.audioResources.clear();
+    this.seekOffsets.clear();
     this.voiceChannelInfos.clear();
     this.autoLeaveIntervalIds.clear();
     this.activeGuildId = null;
@@ -588,6 +681,7 @@ export class DiscordVoiceService implements OnModuleDestroy {
     this.voiceConnections.clear();
     this.audioPlayers.clear();
     this.audioResources.clear();
+    this.seekOffsets.clear();
     this.voiceChannelInfos.clear();
     this.autoLeaveIntervalIds.clear();
     this.activeGuildId = null;
@@ -715,7 +809,9 @@ export class DiscordVoiceService implements OnModuleDestroy {
         continue;
       }
 
-      activeTrack.updatePlaybackProgress(audioResource.playbackDuration);
+      activeTrack.updatePlaybackProgress(
+        (this.seekOffsets.get(guildId) ?? 0) + audioResource.playbackDuration,
+      );
       this.logger.debug(
         `Reporting progress for guild ${guildId}: ${audioResource.playbackDuration} on track ${activeTrack.id}`,
       );
