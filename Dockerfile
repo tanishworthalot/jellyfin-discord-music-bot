@@ -1,5 +1,5 @@
 FROM node:26-alpine
-RUN apk add --no-cache ffmpeg=8.1.2-r0
+RUN apk add --no-cache ffmpeg
 
 COPY . /app
 WORKDIR /app
